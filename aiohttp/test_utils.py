@@ -1,30 +1,26 @@
 """Utilities shared by tests."""
 
-import cgi
-import contextlib
-import gc
-import email.parser
-import functools
-import http.server
-import json
-import logging
-import io
-import os
-import re
-import socket
-import ssl
-import sys
-import threading
-import traceback
-import urllib.parse
-import unittest
-
 import asyncio
+import contextlib
+import functools
+import gc
+import socket
+import unittest
+from abc import ABC, abstractmethod
+from contextlib import contextmanager
+from unittest import mock
+
+from multidict import CIMultiDict
+from yarl import URL
+
 import aiohttp
-from . import server
-from . import helpers
-from . import ClientSession
-from . import hdrs
+from aiohttp.client import _RequestContextManager
+
+from . import ClientSession, hdrs
+from .helpers import PY_35, TimeService, sentinel
+from .http import HttpVersion, RawRequestMessage
+from .signals import Signal
+from .web import Application, Request, Server, UrlMappingMatchInfo
 
 
 def run_briefly(loop):
@@ -35,445 +31,386 @@ def run_briefly(loop):
     loop.run_until_complete(t)
 
 
-@contextlib.contextmanager
-def run_server(loop, *, listen_addr=('127.0.0.1', 0),
-               use_ssl=False, router=None):
-    properties = {}
-    transports = []
-
-    class HttpRequestHandler:
-
-        def __init__(self, addr):
-            if isinstance(addr, tuple):
-                host, port = addr
-                self.host = host
-                self.port = port
-            else:
-                self.host = host = 'localhost'
-                self.port = port = 0
-            self.address = addr
-            self._url = '{}://{}:{}'.format(
-                'https' if use_ssl else 'http', host, port)
-
-        def __getitem__(self, key):
-            return properties[key]
-
-        def __setitem__(self, key, value):
-            properties[key] = value
-
-        def url(self, *suffix):
-            return urllib.parse.urljoin(
-                self._url, '/'.join(str(s) for s in suffix))
-
-    class TestHttpServer(server.ServerHttpProtocol):
-
-        def connection_made(self, transport):
-            transports.append(transport)
-
-            super().connection_made(transport)
-
-        def handle_request(self, message, payload):
-            if properties.get('close', False):
-                return
-
-            for hdr, val in message.headers.items():
-                if (hdr == 'EXPECT') and (val == '100-continue'):
-                    self.transport.write(b'HTTP/1.0 100 Continue\r\n\r\n')
-                    break
-
-            if router is not None:
-                body = yield from payload.read()
-
-                rob = router(
-                    self, properties, self.transport, message, body)
-                rob.dispatch()
-
-            else:
-                response = aiohttp.Response(self.writer, 200, message.version)
-
-                text = b'Test message'
-                response.add_header('Content-type', 'text/plain')
-                response.add_header('Content-length', str(len(text)))
-                response.send_headers()
-                response.write(text)
-                response.write_eof()
-
-    if use_ssl:
-        here = os.path.join(os.path.dirname(__file__), '..', 'tests')
-        keyfile = os.path.join(here, 'sample.key')
-        certfile = os.path.join(here, 'sample.crt')
-        sslcontext = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
-        sslcontext.load_cert_chain(certfile, keyfile)
-    else:
-        sslcontext = None
-
-    def run(loop, fut):
-        thread_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(thread_loop)
-
-        if isinstance(listen_addr, tuple):
-            host, port = listen_addr
-            server_coroutine = thread_loop.create_server(
-                lambda: TestHttpServer(keep_alive=0.5),
-                host, port, ssl=sslcontext)
-        else:
-            try:
-                os.unlink(listen_addr)
-            except FileNotFoundError:
-                pass
-            server_coroutine = thread_loop.create_unix_server(
-                lambda: TestHttpServer(keep_alive=0.5, timeout=15),
-                listen_addr, ssl=sslcontext)
-        server = thread_loop.run_until_complete(server_coroutine)
-
-        waiter = helpers.create_future(thread_loop)
-        loop.call_soon_threadsafe(
-            fut.set_result, (thread_loop, waiter,
-                             server.sockets[0].getsockname()))
-
-        try:
-            thread_loop.run_until_complete(waiter)
-        finally:
-            # call pending connection_made if present
-            run_briefly(thread_loop)
-
-            # close opened transports
-            for tr in transports:
-                tr.close()
-
-            run_briefly(thread_loop)  # call close callbacks
-
-            server.close()
-            thread_loop.stop()
-            thread_loop.close()
-            gc.collect()
-
-    fut = helpers.create_future(loop)
-    server_thread = threading.Thread(target=run, args=(loop, fut))
-    server_thread.start()
-
-    thread_loop, waiter, addr = loop.run_until_complete(fut)
-    try:
-        yield HttpRequestHandler(addr)
-    finally:
-        thread_loop.call_soon_threadsafe(waiter.set_result, None)
-        server_thread.join()
-
-
-class Router:
-
-    _response_version = "1.1"
-    _responses = http.server.BaseHTTPRequestHandler.responses
-
-    def __init__(self, srv, props, transport, message, payload):
-        # headers
-        self._headers = http.client.HTTPMessage()
-        for hdr, val in message.headers.items():
-            self._headers.add_header(hdr, val)
-
-        self._srv = srv
-        self._props = props
-        self._transport = transport
-        self._method = message.method
-        self._uri = message.path
-        self._version = message.version
-        self._compression = message.compression
-        self._body = payload
-
-        url = urllib.parse.urlsplit(self._uri)
-        self._path = url.path
-        self._query = url.query
-
-    @staticmethod
-    def define(rmatch):
-        def wrapper(fn):
-            f_locals = sys._getframe(1).f_locals
-            mapping = f_locals.setdefault('_mapping', [])
-            mapping.append((re.compile(rmatch), fn.__name__))
-            return fn
-
-        return wrapper
-
-    def dispatch(self):  # pragma: no cover
-        for route, fn in self._mapping:
-            match = route.match(self._path)
-            if match is not None:
-                try:
-                    return getattr(self, fn)(match)
-                except Exception:
-                    out = io.StringIO()
-                    traceback.print_exc(file=out)
-                    self._response(500, out.getvalue())
-
-                return
-
-        return self._response(self._start_response(404))
-
-    def _start_response(self, code):
-        return aiohttp.Response(self._srv.writer, code)
-
-    def _response(self, response, body=None,
-                  headers=None, chunked=False, write_body=None):
-        r_headers = {}
-        for key, val in self._headers.items():
-            key = '-'.join(p.capitalize() for p in key.split('-'))
-            r_headers[key] = val
-
-        encoding = self._headers.get('content-encoding', '').lower()
-        if 'gzip' in encoding:  # pragma: no cover
-            cmod = 'gzip'
-        elif 'deflate' in encoding:
-            cmod = 'deflate'
-        else:
-            cmod = ''
-
-        resp = {
-            'method': self._method,
-            'version': '%s.%s' % self._version,
-            'path': self._uri,
-            'headers': r_headers,
-            'origin': self._transport.get_extra_info('addr', ' ')[0],
-            'query': self._query,
-            'form': {},
-            'compression': cmod,
-            'multipart-data': []
-        }
-        if body:  # pragma: no cover
-            resp['content'] = body
-        else:
-            resp['content'] = self._body.decode('utf-8', 'ignore')
-
-        ct = self._headers.get('content-type', '').lower()
-
-        # application/x-www-form-urlencoded
-        if ct == 'application/x-www-form-urlencoded':
-            resp['form'] = urllib.parse.parse_qs(self._body.decode('latin1'))
-
-        # multipart/form-data
-        elif ct.startswith('multipart/form-data'):  # pragma: no cover
-            out = io.BytesIO()
-            for key, val in self._headers.items():
-                out.write(bytes('{}: {}\r\n'.format(key, val), 'latin1'))
-
-            out.write(b'\r\n')
-            out.write(self._body)
-            out.write(b'\r\n')
-            out.seek(0)
-
-            message = email.parser.BytesParser().parse(out)
-            if message.is_multipart():
-                for msg in message.get_payload():
-                    if msg.is_multipart():
-                        logging.warning('multipart msg is not expected')
-                    else:
-                        key, params = cgi.parse_header(
-                            msg.get('content-disposition', ''))
-                        params['data'] = msg.get_payload()
-                        params['content-type'] = msg.get_content_type()
-                        cte = msg.get('content-transfer-encoding')
-                        if cte is not None:
-                            resp['content-transfer-encoding'] = cte
-                        resp['multipart-data'].append(params)
-        body = json.dumps(resp, indent=4, sort_keys=True)
-
-        # default headers
-        hdrs = [('Connection', 'close'),
-                ('Content-Type', 'application/json')]
-        if chunked:
-            hdrs.append(('Transfer-Encoding', 'chunked'))
-        else:
-            hdrs.append(('Content-Length', str(len(body))))
-
-        # extra headers
-        if headers:
-            hdrs.extend(headers.items())
-
-        if chunked:
-            response.enable_chunked_encoding()
-
-        # headers
-        response.add_headers(*hdrs)
-        response.send_headers()
-
-        # write payload
-        if write_body:
-            try:
-                write_body(response, body)
-            except:
-                return
-        else:
-            response.write(helpers.str_to_bytes(body))
-
-        response.write_eof()
-
-        # keep-alive
-        if response.keep_alive():
-            self._srv.keep_alive(True)
-
-
 def unused_port():
-    """ return a port that is unused on the current host. """
+    """Return a port that is unused on the current host."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('127.0.0.1', 0))
         return s.getsockname()[1]
 
 
-class TestClient:
-    """
-    A test client implementation, for a aiohttp.web.Application.
-
-    :param app: the aiohttp.web application passed to create_test_server
-
-    :type app: aiohttp.web.Application
-
-    :param protocol: http or https
-
-    :type protocol: str
-
-    TestClient can also be used as a contextmanager, returning
-    the instance of itself instantiated.
-    """
-
-    def __init__(self, app, protocol="http"):
-        self.app = app
-        self._loop = loop = app.loop
-        self.port = unused_port()
-        self._handler = handler = app.make_handler()
-        self._server = loop.run_until_complete(loop.create_server(
-            handler, '127.0.0.1', self.port
-        ))
-        self._session = ClientSession(loop=self._loop)
-        self._root = "{}://127.0.0.1:{}".format(
-            protocol, self.port
-        )
+class BaseTestServer(ABC):
+    def __init__(self, *, scheme=sentinel,
+                 host='127.0.0.1', skip_url_asserts=False, **kwargs):
+        self.port = None
+        self.server = None
+        self.handler = None
+        self._root = None
+        self.host = host
         self._closed = False
+        self.scheme = scheme
+        self.skip_url_asserts = skip_url_asserts
+
+    @asyncio.coroutine
+    def start_server(self, **kwargs):
+        if self.server:
+            return
+        self.port = unused_port()
+        self._ssl = kwargs.pop('ssl', None)
+        if self.scheme is sentinel:
+            if self._ssl:
+                scheme = 'https'
+            else:
+                scheme = 'http'
+            self.scheme = scheme
+        self._root = URL('{}://{}:{}'.format(self.scheme,
+                                             self.host,
+                                             self.port))
+
+        handler = yield from self._make_factory(**kwargs)
+        self.server = yield from self._loop.create_server(handler,
+                                                          self.host,
+                                                          self.port,
+                                                          ssl=self._ssl)
+
+    @abstractmethod  # pragma: no cover
+    @asyncio.coroutine
+    def _make_factory(self, **kwargs):
+        pass
+
+    def make_url(self, path):
+        url = URL(path)
+        if not self.skip_url_asserts:
+            assert not url.is_absolute()
+            return self._root.join(url)
+        else:
+            return URL(str(self._root) + path)
 
     @property
-    def session(self):
-        """a raw handler to the aiohttp.ClientSession.  unlike the methods on
-        the TestClient, client session requests do not automatically
-        include the host in the url queried, and will require an
-        absolute path to the resource.
-        """
-        return self._session
+    def started(self):
+        return self.server is not None
 
-    def request(self, method, path, *args, **kwargs):
-        """ routes a request to the http server.
-        the interface is identical to asyncio.request,
-        except the loop kwarg is overriden
-        by the instance used by the application.
-        """
-        return self._session.request(
-            method, self._root + path, *args, **kwargs
-        )
+    @property
+    def closed(self):
+        return self._closed
 
-    def get(self, path, *args, **kwargs):
-        """Perform an HTTP GET request. """
-        return self.request(hdrs.METH_GET, path, *args, **kwargs)
-
-    def post(self, path, *args, **kwargs):
-        """Perform an HTTP POST request. """
-        return self.request(hdrs.METH_POST, path, *args, **kwargs)
-
-    def options(self, path, *args, **kwargs):
-        """Perform an HTTP OPTIONS request. """
-        return self.request(hdrs.METH_OPTIONS, path, *args, **kwargs)
-
-    def head(self, path, *args, **kwargs):
-        """Perform an HTTP HEAD request. """
-        return self.request(hdrs.METH_HEAD, path, *args, **kwargs)
-
-    def put(self, path, *args, **kwargs):
-        """Perform an HTTP PUT request."""
-        return self.request(hdrs.METH_PUT, path, *args, **kwargs)
-
-    def patch(self, path, *args, **kwargs):
-        """Perform an HTTP PATCH request."""
-        return self.request(hdrs.METH_PATCH, path, *args, **kwargs)
-
-    def delete(self, path, *args, **kwargs):
-        """Perform an HTTP PATCH request."""
-        return self.request(hdrs.METH_DELETE, path, *args, **kwargs)
-
-    def ws_connect(self, path, *args, **kwargs):
-        """Initiate websocket connection. the api is identical to
-        aiohttp.ClientSession.ws_connect.
-        """
-        return self._session.ws_connect(
-            self._root + path, *args, **kwargs
-        )
-
+    @asyncio.coroutine
     def close(self):
-        """ close all fixtures created by the test client.
-        After that point, the TestClient is no longer
-        usable.
+        """Close all fixtures created by the test client.
 
-        This is an idempotent function: running close
-        multiple times will not have any additional effects.
+        After that point, the TestClient is no longer usable.
 
-        close is also run when the object is garbage collected,
-        and on exit when used as a context manager.
+        This is an idempotent function: running close multiple times
+        will not have any additional effects.
+
+        close is also run when the object is garbage collected, and on
+        exit when used as a context manager.
+
         """
-        if not self._closed:
-            loop = self._loop
-            loop.run_until_complete(self._session.close())
-            self._server.close()
-            loop.run_until_complete(self._server.wait_closed())
-            loop.run_until_complete(self.app.shutdown())
-            loop.run_until_complete(self._handler.finish_connections())
-            loop.run_until_complete(self.app.cleanup())
+        if self.started and not self.closed:
+            self.server.close()
+            yield from self.server.wait_closed()
+            self._root = None
+            self.port = None
+            yield from self._close_hook()
             self._closed = True
 
-    def __del__(self):
-        self.close()
+    @abstractmethod
+    @asyncio.coroutine
+    def _close_hook(self):
+        pass  # pragma: no cover
 
     def __enter__(self):
+        self._loop.run_until_complete(self.start_server())
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
-        self.close()
+        self._loop.run_until_complete(self.close())
+
+    if PY_35:
+        @asyncio.coroutine
+        def __aenter__(self):
+            yield from self.start_server()
+            return self
+
+        @asyncio.coroutine
+        def __aexit__(self, exc_type, exc_value, traceback):
+            yield from self.close()
+
+
+class TestServer(BaseTestServer):
+    def __init__(self, app, *, scheme=sentinel, host='127.0.0.1', **kwargs):
+        self.app = app
+        self._loop = app.loop
+        super().__init__(scheme=scheme, host=host, **kwargs)
+
+    @asyncio.coroutine
+    def _make_factory(self, **kwargs):
+        yield from self.app.startup()
+        self.handler = self.app.make_handler(**kwargs)
+        return self.handler
+
+    @asyncio.coroutine
+    def _close_hook(self):
+        yield from self.app.shutdown()
+        yield from self.handler.shutdown()
+        yield from self.app.cleanup()
+
+
+class RawTestServer(BaseTestServer):
+    def __init__(self, handler, *,
+                 loop=None, scheme=sentinel, host='127.0.0.1', **kwargs):
+        if loop is None:
+            loop = asyncio.get_event_loop()
+        self._loop = loop
+        self._handler = handler
+        super().__init__(scheme=scheme, host=host, **kwargs)
+
+    @asyncio.coroutine
+    def _make_factory(self, debug=True, **kwargs):
+        self.handler = Server(
+            self._handler, loop=self._loop, debug=True, **kwargs)
+        return self.handler
+
+    @asyncio.coroutine
+    def _close_hook(self):
+        return
+
+
+class TestClient:
+    """
+    A test client implementation.
+
+    To write functional tests for aiohttp based servers.
+
+    """
+
+    def __init__(self, app_or_server, *, scheme=sentinel, host=sentinel,
+                 cookie_jar=None, server_kwargs=None, **kwargs):
+        if isinstance(app_or_server, BaseTestServer):
+            if scheme is not sentinel or host is not sentinel:
+                raise ValueError("scheme and host are mutable exclusive "
+                                 "with TestServer parameter")
+            self._server = app_or_server
+        elif isinstance(app_or_server, Application):
+            scheme = "http" if scheme is sentinel else scheme
+            host = '127.0.0.1' if host is sentinel else host
+            server_kwargs = server_kwargs or {}
+            self._server = TestServer(
+                app_or_server,
+                scheme=scheme, host=host, **server_kwargs)
+        else:
+            raise TypeError("app_or_server should be either web.Application "
+                            "or TestServer instance")
+        self._loop = self._server._loop
+        if cookie_jar is None:
+            cookie_jar = aiohttp.CookieJar(unsafe=True,
+                                           loop=self._loop)
+        kwargs['time_service'] = TimeService(self._loop, interval=0.1)
+        self._session = ClientSession(loop=self._loop,
+                                      cookie_jar=cookie_jar,
+                                      **kwargs)
+        self._closed = False
+        self._responses = []
+        self._websockets = []
+
+    @asyncio.coroutine
+    def start_server(self):
+        yield from self._server.start_server()
+
+    @property
+    def host(self):
+        return self._server.host
+
+    @property
+    def port(self):
+        return self._server.port
+
+    @property
+    def server(self):
+        return self._server
+
+    @property
+    def session(self):
+        """An internal aiohttp.ClientSession.
+
+        Unlike the methods on the TestClient, client session requests
+        do not automatically include the host in the url queried, and
+        will require an absolute path to the resource.
+
+        """
+        return self._session
+
+    def make_url(self, path):
+        return self._server.make_url(path)
+
+    @asyncio.coroutine
+    def request(self, method, path, *args, **kwargs):
+        """Routes a request to tested http server.
+
+        The interface is identical to asyncio.ClientSession.request,
+        except the loop kwarg is overridden by the instance used by the
+        test server.
+
+        """
+        resp = yield from self._session.request(
+            method, self.make_url(path), *args, **kwargs
+        )
+        # save it to close later
+        self._responses.append(resp)
+        return resp
+
+    def get(self, path, *args, **kwargs):
+        """Perform an HTTP GET request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_GET, path, *args, **kwargs)
+        )
+
+    def post(self, path, *args, **kwargs):
+        """Perform an HTTP POST request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_POST, path, *args, **kwargs)
+        )
+
+    def options(self, path, *args, **kwargs):
+        """Perform an HTTP OPTIONS request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_OPTIONS, path, *args, **kwargs)
+        )
+
+    def head(self, path, *args, **kwargs):
+        """Perform an HTTP HEAD request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_HEAD, path, *args, **kwargs)
+        )
+
+    def put(self, path, *args, **kwargs):
+        """Perform an HTTP PUT request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_PUT, path, *args, **kwargs)
+        )
+
+    def patch(self, path, *args, **kwargs):
+        """Perform an HTTP PATCH request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_PATCH, path, *args, **kwargs)
+        )
+
+    def delete(self, path, *args, **kwargs):
+        """Perform an HTTP PATCH request."""
+        return _RequestContextManager(
+            self.request(hdrs.METH_DELETE, path, *args, **kwargs)
+        )
+
+    @asyncio.coroutine
+    def ws_connect(self, path, *args, **kwargs):
+        """Initiate websocket connection.
+
+        The api corresponds to aiohttp.ClientSession.ws_connect.
+
+        """
+        ws = yield from self._session.ws_connect(
+            self.make_url(path), *args, **kwargs)
+        self._websockets.append(ws)
+        return ws
+
+    @asyncio.coroutine
+    def close(self):
+        """Close all fixtures created by the test client.
+
+        After that point, the TestClient is no longer usable.
+
+        This is an idempotent function: running close multiple times
+        will not have any additional effects.
+
+        close is also run on exit when used as a(n) (asynchronous)
+        context manager.
+
+        """
+        if not self._closed:
+            for resp in self._responses:
+                resp.close()
+            for ws in self._websockets:
+                yield from ws.close()
+            yield from self._session.close()
+            yield from self._server.close()
+            self._closed = True
+
+    def __enter__(self):
+        self._loop.run_until_complete(self.start_server())
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._loop.run_until_complete(self.close())
+
+    if PY_35:
+        @asyncio.coroutine
+        def __aenter__(self):
+            yield from self.start_server()
+            return self
+
+        @asyncio.coroutine
+        def __aexit__(self, exc_type, exc_value, traceback):
+            yield from self.close()
 
 
 class AioHTTPTestCase(unittest.TestCase):
     """A base class to allow for unittest web applications using
     aiohttp.
 
-    provides the following:
+    Provides the following:
 
     * self.client (aiohttp.test_utils.TestClient): an aiohttp test client.
     * self.loop (asyncio.BaseEventLoop): the event loop in which the
         application and server are running.
     * self.app (aiohttp.web.Application): the application returned by
-        self.get_app()
+        self.get_application()
 
-    note that the TestClient's methods are asynchronous: you will have to
+    Note that the TestClient's methods are asynchronous: you have to
     execute function on the test client using asynchronous methods.
     """
 
-    def get_app(self, loop):
+    @asyncio.coroutine
+    def get_application(self, loop):
         """
-        this method should be overriden
+        This method should be overridden
         to return the aiohttp.web.Application
         object to test.
 
-        :param loop: the event_loop to use
-        :type loop: asyncio.BaseEventLoop
         """
-        pass
+        return self.get_app(loop)
+
+    def get_app(self, loop):
+        """Obsolete method used to constructing web application.
+
+        Use .get_application() coroutine instead
+
+        """
+        pass  # pragma: no cover
 
     def setUp(self):
         self.loop = setup_test_loop()
-        self.app = self.get_app(self.loop)
-        self.client = TestClient(self.app)
+
+        self.app = self.loop.run_until_complete(
+            self.get_application(self.loop))
+        self.client = self.loop.run_until_complete(self._get_client(self.app))
+
+        self.loop.run_until_complete(self.client.start_server())
 
     def tearDown(self):
-        del self.client
+        self.loop.run_until_complete(self.client.close())
         teardown_test_loop(self.loop)
+
+    @asyncio.coroutine
+    def _get_client(self, app):
+        """Return a TestClient instance."""
+        return TestClient(self.app)
 
 
 def unittest_run_loop(func):
-    """a decorator that should be used with asynchronous methods of an
-    AioHTTPTestCase. Handles executing an asynchronous function, using
+    """A decorator dedicated to use with asynchronous methods of an
+    AioHTTPTestCase.
+
+    Handles executing an asynchronous function, using
     the self.loop of the AioHTTPTestCase.
     """
 
@@ -485,40 +422,151 @@ def unittest_run_loop(func):
 
 
 @contextlib.contextmanager
-def loop_context():
-    """a contextmanager that creates an event_loop, for test purposes.
-    handles the creation and cleanup of a test loop.
+def loop_context(loop_factory=asyncio.new_event_loop, fast=False):
+    """A contextmanager that creates an event_loop, for test purposes.
+
+    Handles the creation and cleanup of a test loop.
     """
-    loop = setup_test_loop()
+    loop = setup_test_loop(loop_factory)
     yield loop
-    teardown_test_loop(loop)
+    teardown_test_loop(loop, fast=fast)
 
 
-def setup_test_loop():
-    """create and return an asyncio.BaseEventLoop
-    instance. The caller should also call teardown_test_loop,
+def setup_test_loop(loop_factory=asyncio.new_event_loop):
+    """Create and return an asyncio.BaseEventLoop
+    instance.
+
+    The caller should also call teardown_test_loop,
     once they are done with the loop.
     """
-    loop = asyncio.new_event_loop()
+    loop = loop_factory()
     asyncio.set_event_loop(None)
     return loop
 
 
-def teardown_test_loop(loop):
-    """teardown and cleanup an event_loop created
+def teardown_test_loop(loop, fast=False):
+    """Teardown and cleanup an event_loop created
     by setup_test_loop.
 
-    :param loop: the loop to teardown
-    :type loop: asyncio.BaseEventLoop
     """
-    is_closed = getattr(loop, 'is_closed')
-    if is_closed is not None:
-        closed = is_closed()
-    else:
-        closed = loop._closed
+    closed = loop.is_closed()
     if not closed:
         loop.call_soon(loop.stop)
         loop.run_forever()
         loop.close()
-    gc.collect()
+
+    if not fast:
+        gc.collect()
+
     asyncio.set_event_loop(None)
+
+
+def _create_app_mock():
+    app = mock.Mock()
+    app._debug = False
+    app.on_response_prepare = Signal(app)
+    return app
+
+
+def _create_transport(sslcontext=None):
+    transport = mock.Mock()
+
+    def get_extra_info(key):
+        if key == 'sslcontext':
+            return sslcontext
+        else:
+            return None
+
+    transport.get_extra_info.side_effect = get_extra_info
+    return transport
+
+
+def make_mocked_request(method, path, headers=None, *,
+                        version=HttpVersion(1, 1), closing=False,
+                        app=None,
+                        writer=sentinel,
+                        protocol=sentinel,
+                        transport=sentinel,
+                        payload=sentinel,
+                        sslcontext=None,
+                        secure_proxy_ssl_header=None,
+                        client_max_size=1024**2):
+    """Creates mocked web.Request testing purposes.
+
+    Useful in unit tests, when spinning full web server is overkill or
+    specific conditions and errors are hard to trigger.
+
+    """
+
+    if version < HttpVersion(1, 1):
+        closing = True
+
+    if headers:
+        headers = CIMultiDict(headers)
+        raw_hdrs = tuple(
+            (k.encode('utf-8'), v.encode('utf-8')) for k, v in headers.items())
+    else:
+        headers = CIMultiDict()
+        raw_hdrs = ()
+
+    chunked = 'chunked' in headers.get(hdrs.TRANSFER_ENCODING, '').lower()
+
+    message = RawRequestMessage(
+        method, path, version, headers,
+        raw_hdrs, closing, False, False, chunked, URL(path))
+    if app is None:
+        app = _create_app_mock()
+
+    if protocol is sentinel:
+        protocol = mock.Mock()
+
+    if transport is sentinel:
+        transport = _create_transport(sslcontext)
+
+    if writer is sentinel:
+        writer = mock.Mock()
+        writer.transport = transport
+
+    protocol.transport = transport
+    protocol.writer = writer
+
+    if payload is sentinel:
+        payload = mock.Mock()
+
+    time_service = mock.Mock()
+    time_service.time.return_value = 12345
+    time_service.strtime.return_value = "Tue, 15 Nov 1994 08:12:31 GMT"
+
+    @contextmanager
+    def timeout(*args, **kw):
+        yield
+
+    time_service.timeout = mock.Mock()
+    time_service.timeout.side_effect = timeout
+
+    task = mock.Mock()
+    loop = mock.Mock()
+    loop.create_future.return_value = ()
+
+    req = Request(message, payload,
+                  protocol, time_service, task,
+                  loop=loop,
+                  secure_proxy_ssl_header=secure_proxy_ssl_header,
+                  client_max_size=client_max_size)
+
+    match_info = UrlMappingMatchInfo({}, mock.Mock())
+    match_info.add_app(app)
+    req._match_info = match_info
+
+    return req
+
+
+def make_mocked_coro(return_value=sentinel, raise_exception=sentinel):
+    """Creates a coroutine mock."""
+    @asyncio.coroutine
+    def mock_coro(*args, **kwargs):
+        if raise_exception is not sentinel:
+            raise raise_exception
+        return return_value
+
+    return mock.Mock(wraps=mock_coro)

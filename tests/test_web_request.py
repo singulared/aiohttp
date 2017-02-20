@@ -1,52 +1,23 @@
-import pytest
+import asyncio
+from collections import MutableMapping
 from unittest import mock
-from multidict import MultiDict, CIMultiDict
-from aiohttp.signals import Signal
-from aiohttp.web import Request
-from aiohttp.protocol import HttpVersion
-from aiohttp.protocol import RawRequestMessage
+
+import pytest
+from multidict import CIMultiDict, MultiDict
+from yarl import URL
+
+from aiohttp import HttpVersion
+from aiohttp.streams import StreamReader
+from aiohttp.test_utils import make_mocked_request
+from aiohttp.web import HTTPRequestEntityTooLarge
 
 
 @pytest.fixture
 def make_request():
-    def maker(method, path, headers=CIMultiDict(), *,
-              version=HttpVersion(1, 1), closing=False,
-              sslcontext=None,
-              secure_proxy_ssl_header=None):
-        if version < HttpVersion(1, 1):
-            closing = True
-        app = mock.Mock()
-        app._debug = False
-        app.on_response_prepare = Signal(app)
-        message = RawRequestMessage(method, path, version, headers,
-                                    [(k.encode('utf-8'), v.encode('utf-8'))
-                                     for k, v in headers.items()],
-                                    closing, False)
-        payload = mock.Mock()
-        transport = mock.Mock()
-
-        def get_extra_info(key):
-            if key == 'sslcontext':
-                return sslcontext
-            else:
-                return None
-
-        transport.get_extra_info.side_effect = get_extra_info
-        writer = mock.Mock()
-        reader = mock.Mock()
-        req = Request(app, message, payload,
-                      transport, reader, writer,
-                      secure_proxy_ssl_header=secure_proxy_ssl_header)
-
-        assert req.app is app
-        assert req.content is payload
-        assert req.transport is transport
-
-        return req
-    return maker
+    return make_mocked_request
 
 
-def test_ctor(make_request, warning):
+def test_ctor(make_request):
     req = make_request('GET', '/path/to?a=1&b=2')
 
     assert 'GET' == req.method
@@ -55,21 +26,36 @@ def test_ctor(make_request, warning):
     assert '/path/to?a=1&b=2' == req.path_qs
     assert '/path/to' == req.path
     assert 'a=1&b=2' == req.query_string
+    assert CIMultiDict() == req.headers
+    assert () == req.raw_headers
+    assert req.message == req._message
 
     get = req.GET
     assert MultiDict([('a', '1'), ('b', '2')]) == get
     # second call should return the same object
     assert get is req.GET
 
-    with warning(DeprecationWarning):
-        req.payload
-
     assert req.keep_alive
+
+    # just make sure that all lines of make_mocked_request covered
+    headers = CIMultiDict(FOO='bar')
+    payload = mock.Mock()
+    protocol = mock.Mock()
+    app = mock.Mock()
+    req = make_request('GET', '/path/to?a=1&b=2', headers=headers,
+                       protocol=protocol, payload=payload, app=app)
+    assert req.app is app
+    assert req.content is payload
+    assert req.protocol is protocol
+    assert req.transport is protocol.transport
+    assert req.headers == headers
+    assert req.raw_headers == ((b'Foo', b'bar'),)
 
 
 def test_doubleslashes(make_request):
-    req = make_request('GET', '//foo/')
-    assert '//foo/' == req.path
+    # NB: //foo/bar is an absolute URL with foo netloc and /bar path
+    req = make_request('GET', '/bar//foo/')
+    assert '/bar//foo/' == req.path
 
 
 def test_POST(make_request):
@@ -121,6 +107,11 @@ def test_non_ascii_path(make_request):
     assert '/путь' == req.path
 
 
+def test_non_ascii_raw_path(make_request):
+    req = make_request('GET', '/путь')
+    assert '/путь' == req.raw_path
+
+
 def test_content_length(make_request):
     req = make_request('Get', '/',
                        CIMultiDict([('CONTENT-LENGTH', '123')]))
@@ -138,7 +129,7 @@ def test_non_keepalive_on_closing(make_request):
     assert not req.keep_alive
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_call_POST_on_GET_request(make_request):
     req = make_request('GET', '/')
 
@@ -146,7 +137,7 @@ def test_call_POST_on_GET_request(make_request):
     assert CIMultiDict() == ret
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_call_POST_on_weird_content_type(make_request):
     req = make_request(
         'POST', '/',
@@ -156,7 +147,7 @@ def test_call_POST_on_weird_content_type(make_request):
     assert CIMultiDict() == ret
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_call_POST_twice(make_request):
     req = make_request('GET', '/')
 
@@ -194,23 +185,36 @@ def test_request_cookie__set_item(make_request):
 
 def test_match_info(make_request):
     req = make_request('GET', '/')
-    assert req.match_info is None
-    match = {'a': 'b'}
-    req._match_info = match
-    assert match is req.match_info
+    assert req._match_info is req.match_info
 
 
-def test_request_is_dict(make_request):
+def test_request_is_mutable_mapping(make_request):
     req = make_request('GET', '/')
-    assert isinstance(req, dict)
+    assert isinstance(req, MutableMapping)
     req['key'] = 'value'
     assert 'value' == req['key']
 
 
-def test_copy(make_request):
+def test_request_delitem(make_request):
     req = make_request('GET', '/')
-    with pytest.raises(NotImplementedError):
-        req.copy()
+    req['key'] = 'value'
+    assert 'value' == req['key']
+    del req['key']
+    assert 'key' not in req
+
+
+def test_request_len(make_request):
+    req = make_request('GET', '/')
+    assert len(req) == 0
+    req['key'] = 'value'
+    assert len(req) == 1
+
+
+def test_request_iter(make_request):
+    req = make_request('GET', '/')
+    req['key'] = 'value'
+    req['key2'] = 'value2'
+    assert set(req) == {'key', 'key2'}
 
 
 def test___repr__(make_request):
@@ -250,4 +254,107 @@ def test_https_scheme_by_secure_proxy_ssl_header_false_test(make_request):
 def test_raw_headers(make_request):
     req = make_request('GET', '/',
                        headers=CIMultiDict({'X-HEADER': 'aaa'}))
-    assert req.raw_headers == ((b'X-HEADER', b'aaa'),)
+    assert req.raw_headers == ((b'X-Header', b'aaa'),)
+
+
+def test_rel_url(make_request):
+    req = make_request('GET', '/path')
+    assert URL('/path') == req.rel_url
+
+
+def test_url_url(make_request):
+    req = make_request('GET', '/path', headers={'HOST': 'example.com'})
+    assert URL('http://example.com/path') == req.url
+
+
+def test_clone():
+    req = make_mocked_request('GET', '/path')
+    req2 = req.clone()
+    assert req2.method == 'GET'
+    assert req2.rel_url == URL('/path')
+
+
+def test_clone_method():
+    req = make_mocked_request('GET', '/path')
+    req2 = req.clone(method='POST')
+    assert req2.method == 'POST'
+    assert req2.rel_url == URL('/path')
+
+
+def test_clone_rel_url():
+    req = make_mocked_request('GET', '/path')
+    req2 = req.clone(rel_url=URL('/path2'))
+    assert req2.rel_url == URL('/path2')
+
+
+def test_clone_rel_url_str():
+    req = make_mocked_request('GET', '/path')
+    req2 = req.clone(rel_url='/path2')
+    assert req2.rel_url == URL('/path2')
+
+
+def test_clone_headers():
+    req = make_mocked_request('GET', '/path', headers={'A': 'B'})
+    req2 = req.clone(headers=CIMultiDict({'B': 'C'}))
+    assert req2.headers == CIMultiDict({'B': 'C'})
+    assert req2.raw_headers == ((b'B', b'C'),)
+
+
+def test_clone_headers_dict():
+    req = make_mocked_request('GET', '/path', headers={'A': 'B'})
+    req2 = req.clone(headers={'B': 'C'})
+    assert req2.headers == CIMultiDict({'B': 'C'})
+    assert req2.raw_headers == ((b'B', b'C'),)
+
+
+@asyncio.coroutine
+def test_cannot_clone_after_read(loop):
+    payload = StreamReader(loop=loop)
+    payload.feed_data(b'data')
+    payload.feed_eof()
+    req = make_mocked_request('GET', '/path', payload=payload)
+    yield from req.read()
+    with pytest.raises(RuntimeError):
+        req.clone()
+
+
+@asyncio.coroutine
+def test_make_too_big_request(loop):
+    payload = StreamReader(loop=loop)
+    large_file = 1024 ** 2 * b'x'
+    too_large_file = large_file + b'x'
+    payload.feed_data(too_large_file)
+    payload.feed_eof()
+    req = make_mocked_request('POST', '/', payload=payload)
+    with pytest.raises(HTTPRequestEntityTooLarge) as err:
+        yield from req.read()
+
+    assert err.value.status_code == 413
+
+
+@asyncio.coroutine
+def test_make_too_big_request_adjust_limit(loop):
+    payload = StreamReader(loop=loop)
+    large_file = 1024 ** 2 * b'x'
+    too_large_file = large_file + b'x'
+    payload.feed_data(too_large_file)
+    payload.feed_eof()
+    max_size = 1024**2 + 2
+    req = make_mocked_request('POST', '/', payload=payload,
+                              client_max_size=max_size)
+    txt = yield from req.read()
+    assert len(txt) == 1024**2 + 1
+
+
+@asyncio.coroutine
+def test_make_too_big_request_limit_None(loop):
+    payload = StreamReader(loop=loop)
+    large_file = 1024 ** 2 * b'x'
+    too_large_file = large_file + b'x'
+    payload.feed_data(too_large_file)
+    payload.feed_eof()
+    max_size = None
+    req = make_mocked_request('POST', '/', payload=payload,
+                              client_max_size=max_size)
+    txt = yield from req.read()
+    assert len(txt) == 1024**2 + 1

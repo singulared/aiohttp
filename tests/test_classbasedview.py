@@ -1,9 +1,10 @@
 import asyncio
+from unittest import mock
+
 import pytest
 
 from aiohttp import web
 from aiohttp.web_urldispatcher import View
-from unittest import mock
 
 
 def test_ctor():
@@ -12,7 +13,7 @@ def test_ctor():
     assert view.request is request
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_render_ok():
     resp = web.Response(text='OK')
 
@@ -22,12 +23,12 @@ def test_render_ok():
             return resp
 
     request = mock.Mock()
-    request.method = 'GET'
+    request._method = 'GET'
     resp2 = yield from MyView(request)
     assert resp is resp2
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_render_unknown_method():
 
     class MyView(View):
@@ -44,7 +45,7 @@ def test_render_unknown_method():
     assert ctx.value.status == 405
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_render_unsupported_method():
 
     class MyView(View):

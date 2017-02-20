@@ -1,3 +1,4 @@
+*.swp
 *.bak
 *.egg
 *.egg-info
@@ -20,6 +21,7 @@
 .vimrc
 aiohttp/_multidict.c
 aiohttp/_multidict.html
+aiohttp/_http_parser.c
 bin
 build
 cover
@@ -42,3 +44,5 @@ aiohttp/_websocket.c
 aiohttp/_websocket.html
 .install-deps
 .develop
+.gitconfig
+.flake

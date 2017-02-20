@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+
 import aiohttp
 
 
@@ -17,11 +18,11 @@ def client(loop, url, name):
         while True:
             msg = yield from ws.receive()
 
-            if msg.tp == aiohttp.MsgType.text:
+            if msg.type == aiohttp.WSMsgType.text:
                 ws.send_str(msg.data)
-            elif msg.tp == aiohttp.MsgType.binary:
+            elif msg.type == aiohttp.WSMsgType.binary:
                 ws.send_bytes(msg.data)
-            elif msg.tp == aiohttp.MsgType.close:
+            elif msg.type == aiohttp.WSMsgType.close:
                 yield from ws.close()
                 break
             else:

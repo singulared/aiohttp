@@ -3,16 +3,17 @@ import contextlib
 import gc
 import re
 import types
-import http.cookies
 from unittest import mock
 
+import pytest
 from multidict import CIMultiDict, MultiDict
+from yarl import URL
 
 import aiohttp
-import pytest
 from aiohttp import web
 from aiohttp.client import ClientSession
 from aiohttp.connector import BaseConnector, TCPConnector
+from aiohttp.helpers import SimpleCookie
 
 
 @pytest.fixture
@@ -94,18 +95,20 @@ def test_init_headers_list_of_tuples_with_duplicates(create_session):
 def test_init_cookies_with_simple_dict(create_session):
     session = create_session(cookies={"c1": "cookie1",
                                       "c2": "cookie2"})
-    assert set(session.cookies) == {'c1', 'c2'}
-    assert session.cookies['c1'].value == 'cookie1'
-    assert session.cookies['c2'].value == 'cookie2'
+    cookies = session.cookie_jar.filter_cookies()
+    assert set(cookies) == {'c1', 'c2'}
+    assert cookies['c1'].value == 'cookie1'
+    assert cookies['c2'].value == 'cookie2'
 
 
 def test_init_cookies_with_list_of_tuples(create_session):
     session = create_session(cookies=[("c1", "cookie1"),
                                       ("c2", "cookie2")])
 
-    assert set(session.cookies) == {'c1', 'c2'}
-    assert session.cookies['c1'].value == 'cookie1'
-    assert session.cookies['c2'].value == 'cookie2'
+    cookies = session.cookie_jar.filter_cookies()
+    assert set(cookies) == {'c1', 'c2'}
+    assert cookies['c1'].value == 'cookie1'
+    assert cookies['c2'].value == 'cookie2'
 
 
 def test_merge_headers(create_session):
@@ -249,7 +252,7 @@ def test_close(create_session, connector):
 
     session.close()
     assert session.connector is None
-    assert connector.closed
+    assert not connector.closed
 
 
 def test_closed(session):
@@ -258,10 +261,24 @@ def test_closed(session):
     assert session.closed
 
 
-def test_connector(create_session, loop):
+def test_connector(create_session, loop, mocker):
     connector = TCPConnector(loop=loop)
+    mocker.spy(connector, 'close')
     session = create_session(connector=connector)
     assert session.connector is connector
+
+    session.close()
+    assert not connector.close.called
+    connector.close()
+
+
+def test_create_connector(create_session, loop, mocker):
+    session = create_session()
+    connector = session.connector
+    mocker.spy(session.connector, 'close')
+
+    session.close()
+    assert connector.close.called
 
 
 def test_connector_loop(loop):
@@ -270,15 +287,10 @@ def test_connector_loop(loop):
         stack.enter_context(contextlib.closing(another_loop))
         connector = TCPConnector(loop=another_loop)
         stack.enter_context(contextlib.closing(connector))
-        with pytest.raises(ValueError) as ctx:
+        with pytest.raises(RuntimeError) as ctx:
             ClientSession(connector=connector, loop=loop)
-        assert re.match("loop argument must agree with connector",
+        assert re.match("Session and connector has to use same event loop",
                         str(ctx.value))
-
-
-def test_cookies_are_readonly(session):
-    with pytest.raises(AttributeError):
-        session.cookies = 123
 
 
 def test_detach(session):
@@ -293,7 +305,7 @@ def test_detach(session):
         conn.close()
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_request_closed_session(session):
     session.close()
     with pytest.raises(RuntimeError):
@@ -314,15 +326,15 @@ def test_double_close(connector, create_session):
     assert session.connector is None
     session.close()
     assert session.closed
-    assert connector.closed
+    assert not connector.closed
 
 
-def test_del(connector, loop, warning):
+def test_del(connector, loop):
     # N.B. don't use session fixture, it stores extra reference internally
     session = ClientSession(connector=connector, loop=loop)
     loop.set_exception_handler(lambda loop, ctx: None)
 
-    with warning(ResourceWarning):
+    with pytest.warns(ResourceWarning):
         del session
         gc.collect()
 
@@ -342,7 +354,7 @@ def test_borrow_connector_loop(connector, create_session, loop):
         session.close()
 
 
-@pytest.mark.run_loop
+@asyncio.coroutine
 def test_reraise_os_error(create_session):
     err = OSError(1, "permission error")
     req = mock.Mock()
@@ -363,7 +375,9 @@ def test_reraise_os_error(create_session):
     assert e.strerror == err.strerror
 
 
+@asyncio.coroutine
 def test_request_ctx_manager_props(loop):
+    yield from asyncio.sleep(0, loop=loop)  # to make it a task
     with aiohttp.ClientSession(loop=loop) as client:
         ctx_mgr = client.get('http://example.com')
 
@@ -371,22 +385,15 @@ def test_request_ctx_manager_props(loop):
         assert isinstance(ctx_mgr.gi_frame, types.FrameType)
         assert not ctx_mgr.gi_running
         assert isinstance(ctx_mgr.gi_code, types.CodeType)
+        yield from asyncio.sleep(0.1, loop=loop)
 
 
-@pytest.mark.run_loop
-def test_cookie_jar_usage(create_app_and_client):
+@asyncio.coroutine
+def test_cookie_jar_usage(loop, test_client):
     req_url = None
 
-    init_mock = mock.Mock(return_value=None)
-    update_mock = mock.Mock(return_value=None)
-    filter_mock = mock.Mock(return_value=None)
-
-    patches = mock.patch.multiple(
-        "aiohttp.helpers.CookieJar",
-        __init__=init_mock,
-        update_cookies=update_mock,
-        filter_cookies=filter_mock,
-    )
+    jar = mock.Mock()
+    jar.filter_cookies.return_value = None
 
     @asyncio.coroutine
     def handler(request):
@@ -397,30 +404,63 @@ def test_cookie_jar_usage(create_app_and_client):
         resp.set_cookie("response", "resp_value")
         return resp
 
-    with patches:
-        app, client = yield from create_app_and_client(
-            client_params={"cookies": {"request": "req_value"}}
-        )
-        app.router.add_route('GET', '/', handler)
+    app = web.Application(loop=loop)
+    app.router.add_route('GET', '/', handler)
+    session = yield from test_client(app,
+                                     cookies={"request": "req_value"},
+                                     cookie_jar=jar)
 
-        # Updating the cookie jar with initial user defined cookies
-        assert init_mock.called
-        assert update_mock.called
-        assert update_mock.call_args[0] == (
-            {"request": "req_value"},
-        )
+    # Updating the cookie jar with initial user defined cookies
+    jar.update_cookies.assert_called_with({"request": "req_value"})
 
-        update_mock.reset_mock()
-        yield from client.get("/")
+    jar.update_cookies.reset_mock()
+    resp = yield from session.get("/")
+    yield from resp.release()
 
-        # Filtering the cookie jar before sending the request,
-        # getting the request URL as only parameter
-        assert filter_mock.called
-        assert filter_mock.call_args[0] == (req_url,)
+    # Filtering the cookie jar before sending the request,
+    # getting the request URL as only parameter
+    jar.filter_cookies.assert_called_with(URL(req_url))
 
-        # Updating the cookie jar with the response cookies
-        assert update_mock.called
-        resp_cookies = update_mock.call_args[0][0]
-        assert isinstance(resp_cookies, http.cookies.SimpleCookie)
-        assert "response" in resp_cookies
-        assert resp_cookies["response"].value == "resp_value"
+    # Updating the cookie jar with the response cookies
+    assert jar.update_cookies.called
+    resp_cookies = jar.update_cookies.call_args[0][0]
+    assert isinstance(resp_cookies, SimpleCookie)
+    assert "response" in resp_cookies
+    assert resp_cookies["response"].value == "resp_value"
+
+
+def test_session_default_version(loop):
+    session = aiohttp.ClientSession(loop=loop)
+    assert session.version == aiohttp.HttpVersion11
+
+
+def test_session_loop(loop):
+    session = aiohttp.ClientSession(loop=loop)
+    assert session.loop is loop
+    session.close()
+
+
+def test_proxy_str(session, params):
+    with mock.patch("aiohttp.client.ClientSession._request") as patched:
+        session.get("http://test.example.com",
+                    proxy='http://proxy.com',
+                    **params)
+    assert patched.called, "`ClientSession._request` not called"
+    assert list(patched.call_args) == [("GET", "http://test.example.com",),
+                                       dict(
+                                           allow_redirects=True,
+                                           proxy='http://proxy.com',
+                                           **params)]
+
+
+def test_client_session_implicit_loop_warn():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    with pytest.warns(ResourceWarning):
+        session = aiohttp.ClientSession()
+        assert session._loop is loop
+        session.close()
+
+    asyncio.set_event_loop(None)
+    loop.close()

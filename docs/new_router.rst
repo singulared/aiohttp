@@ -6,7 +6,7 @@ Router refactoring in 0.21
 Rationale
 ---------
 
-First generation (v1) of router mapped ``(method, path)`` pair to
+First generation (v1) of router has mapped ``(method, path)`` pair to
 :term:`web-handler`.  Mapping is named **route**. Routes used to have
 unique names if any.
 
@@ -70,8 +70,8 @@ instance instead of :class:`aiohttp.web.Route` but resource has the
 same ``resource.url(...)`` most useful method, so end user should feel no
 difference.
 
-``resource.match(...)`` is supported as well (while we believe it's
-not used widely).
+``route.match(...)`` is **not** supported anymore, use
+:meth:`aiohttp.web.AbstractResource.resolve` instead.
 
 ``app.router.add_route(method, path, handler, name='name')`` now is just
 shortcut for::
@@ -82,3 +82,7 @@ shortcut for::
 
 ``app.router.register_route(...)`` is still supported, it creates
 :class:`aiohttp.web.ResourceAdapter` for every call (but it's deprecated now).
+
+
+.. disqus::
+  :title: aiohttp router refactoring notes
